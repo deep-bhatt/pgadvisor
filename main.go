@@ -30,6 +30,11 @@ func main() {
 		fmt.Printf("Vaccum check: %v\n", err)
 		os.Exit(1)
 	}
+
+	if err := checkUnusedIndexes(ctx, conn); err != nil {
+		fmt.Printf("Unused index check failed: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func checkVaccum(ctx context.Context, conn *pgx.Conn) error {
@@ -72,4 +77,69 @@ func checkVaccum(ctx context.Context, conn *pgx.Conn) error {
 	}
 
 	return rows.Err()
+}
+
+func checkUnusedIndexes(ctx context.Context, conn *pgx.Conn) error {
+	var statsReset *time.Time
+	err := conn.QueryRow(ctx, `
+		SELECT pg_stat_get_db_stat_reset_time(d.oid)
+		FROM pg_database d
+		WHERE d.datname = current_database()`,
+	).Scan(&statsReset)
+	if err != nil {
+		return fmt.Errorf("stats reset check failed: %w", err)
+	}
+
+	if statsReset == nil || time.Since(*statsReset) < 7*24*time.Hour {
+		fmt.Println("[info] Stats have been accumulating for less than 7 days. Skipping unused index check.")
+		return nil
+	}
+
+	rows, err := conn.Query(ctx, `
+		SELECT s.schemaname, s.relname, s.indexrelname,
+		       pg_relation_size(s.indexrelid)
+		FROM pg_stat_user_indexes s
+		WHERE s.idx_scan = 0
+		  AND s.schemaname NOT IN ('pg_catalog', 'pg_toast')
+		ORDER BY pg_relation_size(s.indexrelid) DESC`)
+	if err != nil {
+		return fmt.Errorf("unused index query failed: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var schema, table, index string
+		var sizeBytes int64
+
+		err := rows.Scan(&schema, &table, &index, &sizeBytes)
+		if err != nil {
+			return fmt.Errorf("scanning unused index row: %w", err)
+		}
+
+		severity := "info"
+		if sizeBytes > 10*1024*1024 {
+			severity = "warning"
+		}
+		if sizeBytes > 100*1024*1024 {
+			severity = "critical"
+		}
+
+		fmt.Printf("[%s] %s.%s: index %s has never been used (%s). Suggest: DROP INDEX %s.%s;\n",
+			severity, schema, table, index, formatBytes(sizeBytes), schema, index)
+	}
+
+	return rows.Err()
+}
+
+func formatBytes(b int64) string {
+	switch {
+	case b >= 1024*1024*1024:
+		return fmt.Sprintf("%.1f GB", float64(b)/(1024*1024*1024))
+	case b >= 1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
+	case b >= 1024:
+		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
